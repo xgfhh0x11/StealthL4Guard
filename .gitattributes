@@ -1,0 +1,5 @@
+# Force LF line endings for shell scripts regardless of local
+# core.autocrlf, so kernel-test/*.sh always runs correctly under WSL/Linux
+# even when this repo is checked out on a Windows host with
+# core.autocrlf=true.
+*.sh text eol=lf
