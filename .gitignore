@@ -1,0 +1,32 @@
+# Compiled eBPF objects (produced by `make` in bpf/)
+*.o
+*.ll
+*.bc
+
+# Build outputs
+build/
+*.tmp
+
+# Pinned BPF maps (created at deploy time under /sys/fs/bpf/)
+# — not relevant to the repo, but listed here so a `make install`
+# variant doesn't accidentally commit local pins.
+pin/
+
+# CI runtime
+.github/cache/
+
+# Python (tests/)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

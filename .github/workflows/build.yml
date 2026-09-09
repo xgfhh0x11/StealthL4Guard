@@ -1,0 +1,64 @@
+name: eBPF build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libbpf-dev \
+            linux-headers-$(uname -r) \
+            linux-libc-dev \
+            gcc-multilib
+
+      - name: Show clang version
+        run: clang --version
+
+      - name: Compile eBPF programs
+        run: |
+          cd bpf
+          make all
+
+      - name: Smoke-check object files
+        run: |
+          cd bpf
+          make check
+
+      - name: Validate nftables config (dry-run)
+        run: |
+          sudo apt-get install -y nftables
+          sudo nft -c -f config/nftables.conf
+
+      - name: Validate HAProxy config
+        run: |
+          sudo apt-get install -y haproxy
+          sudo haproxy -c -f config/haproxy.cfg
+
+      - name: eBPF syntax check (no kernel/libbpf needed)
+        run: |
+          clang -fsyntax-only -target bpf -Ibpf bpf/xdp_l4_guard.c
+          clang -fsyntax-only -target bpf -Ibpf bpf/tc_l4_guard.c
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run structure + mark-protocol tests
+        run: python -m pytest tests/ -v
