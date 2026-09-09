@@ -200,11 +200,15 @@ Three properties are worth noting:
    the *mechanism* (the behavioral classifier) stays in the
    compiled eBPF program.
 
-3. **The map is in-place updated.** Counter increments on map
-   values are not atomic across CPUs. Counters can lose a small
-   number of updates under high core-count load. The signal is
-   statistical, so the loss is tolerable; a strict counter would
-   require `__sync_fetch_and_add` and is a one-line change.
+3. **The map is in-place updated.** Counter increments use
+   `__sync_fetch_and_add` per field, so a single field cannot
+   silently lose an update under concurrent CPUs on the same flow.
+   The four fields (`pkt_count`, `syn_count`, `ack_count`,
+   `udp_count`) are still not updated as one atomic transaction — a
+   reader can observe partial progress across them — which is
+   tolerable for these statistical thresholds; a fully race-free
+   counter would need `BPF_MAP_TYPE_PERCPU_HASH`. This has not been
+   verified against a real kernel (see README Status).
 
 ### 3.3 Failure mode
 

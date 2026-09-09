@@ -146,20 +146,41 @@ account_v4(__u32 src, __u64 now, int is_syn, int is_udp,
         return;
     }
 
-    if (now - w->window_start_ns > WINDOW_NS) {
-        /* Window rolled — reset. */
-        w->window_start_ns = now;
+    /*
+     * Multiple RSS CPUs can call this concurrently against the same
+     * LRU value. Two races matter:
+     *
+     *   1. Plain "++" on pkt_count/syn_count/udp_count can lose
+     *      updates under concurrent read-modify-write.
+     *   2. Two CPUs can both observe "window rolled" and both reset
+     *      window_start_ns + counts, each stomping the other's
+     *      reset (and silently dropping whichever packet's counts
+     *      lost the race), or reset the window twice in a row.
+     *
+     * The compare-and-swap on window_start_ns below ensures only
+     * the CPU that "wins" the roll actually performs the reset;
+     * every other CPU (whether it saw the window as rolled or not)
+     * falls through to the atomic-increment path against whatever
+     * window is current. This is not a fully atomic multi-field
+     * transaction — a reader can still observe pkt_count bumped
+     * slightly ahead of syn_count/udp_count — but that is
+     * acceptable for statistical rate thresholds. A strictly
+     * race-free design would use BPF_MAP_TYPE_PERCPU_HASH and fold
+     * per-CPU views at read time.
+     */
+    __u64 start = w->window_start_ns;
+    if (now - start > WINDOW_NS &&
+        __sync_val_compare_and_swap(&w->window_start_ns, start, now) == start) {
         w->pkt_count = 1;
         w->syn_count = is_syn ? 1 : 0;
         w->udp_count = is_udp ? 1 : 0;
-    } else {
-        w->pkt_count++;
-        if (is_syn) w->syn_count++;
-        if (is_udp) w->udp_count++;
+        *pps = 1; *syns = w->syn_count; *udps = w->udp_count;
+        return;
     }
-    *pps = w->pkt_count;
-    *syns = w->syn_count;
-    *udps = w->udp_count;
+
+    *pps  = __sync_fetch_and_add(&w->pkt_count, 1) + 1;
+    *syns = is_syn ? __sync_fetch_and_add(&w->syn_count, 1) + 1 : w->syn_count;
+    *udps = is_udp ? __sync_fetch_and_add(&w->udp_count, 1) + 1 : w->udp_count;
 }
 
 /* ---- main ------------------------------------------------------ */
@@ -198,8 +219,14 @@ int xdp_l4_guard(struct xdp_md *ctx)
         if (bpf_map_lookup_elem(&blocked_prefixes_v4, &lk)) {
             /* Probabilistic drop: even a "known bad" prefix is
              * dropped only with high probability, so the attacker
-             * cannot calibrate a clean 100 % boundary. */
-            return prob_drop(DROP_PROB_HIGH) ? XDP_DROP : XDP_PASS;
+             * cannot calibrate a clean 100 % boundary. A packet that
+             * survives the coin flip falls through to the same
+             * flag/rate checks below as an unlisted source — it must
+             * not get an unconditional XDP_PASS, or a blocklisted
+             * source would end up with *weaker* inspection than an
+             * unlisted one for the fraction of packets that survive. */
+            if (prob_drop(DROP_PROB_HIGH))
+                return XDP_DROP;
         }
 
         /* Protocol fan-out. */

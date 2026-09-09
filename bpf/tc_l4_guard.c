@@ -156,10 +156,17 @@ int tc_l4_guard(struct __sk_buff *skb)
         bpf_map_update_elem(&flow_table, &key, &new_st, BPF_ANY);
         st = &new_st;
     } else {
-        /* Existing flow — in-place update on map value.
-         * Not atomic across CPUs; we trade strict accuracy for
-         * speed and the verifier's blessing. See README. */
-        st->pkt_count++;
+        /* Existing flow — in-place update on map value, shared
+         * across RSS CPUs that can process packets from the same
+         * flow concurrently. Use atomic fetch-and-add instead of a
+         * plain "++" so concurrent CPUs don't clobber each other's
+         * read-modify-write and silently lose increments. This does
+         * not make the whole struct update a single atomic
+         * transaction (a reader can still observe pkt_count bumped
+         * before syn_count/ack_count/udp_count), which is acceptable
+         * for these statistical thresholds; a fully race-free design
+         * would use BPF_MAP_TYPE_PERCPU_HASH instead. See README. */
+        __sync_fetch_and_add(&st->pkt_count, 1);
 
         if (proto == IPPROTO_TCP) {
             struct tcphdr *tcph = (void *)(iph + 1);
@@ -167,11 +174,11 @@ int tc_l4_guard(struct __sk_buff *skb)
                 return TC_ACT_OK;
 
             if (tcph->syn && !tcph->ack)
-                st->syn_count++;
+                __sync_fetch_and_add(&st->syn_count, 1);
             else if (tcph->ack)
-                st->ack_count++;
+                __sync_fetch_and_add(&st->ack_count, 1);
         } else {
-            st->udp_count++;
+            __sync_fetch_and_add(&st->udp_count, 1);
         }
     }
 

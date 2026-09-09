@@ -17,7 +17,6 @@
 # `ip link set ... xdp obj ...` and `tc filter add ... bpf obj ...`.
 
 CLANG       ?= clang
-LLC         ?= llc
 BPFTOOL     ?= bpftool
 ARCH        := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 KDIR        ?= /lib/modules/$(shell uname -r)/build

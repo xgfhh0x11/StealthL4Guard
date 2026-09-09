@@ -236,30 +236,58 @@ sudo systemctl stop haproxy   # or `kill` the haproxy pid
 
 ## Observability
 
-The data plane is silent to attackers. It is **not** silent to
-operators. The recommended observation surfaces:
+The data plane is silent to attackers. It is meant to *not* be
+silent to operators, but the code as it exists today has limited
+built-in instrumentation. Be aware of what each tool below actually
+shows, as-is:
 
-- `bpftool prog tracelog` — XDP/TC verifier output and `bpf_printk`
-  traces.
-- `bpftool map dump pinned /sys/fs/bpf/<map>` — live read of LRU
-  rate maps and flow table.
-- `perf top` — confirm XDP/TC CPU cost stays below `0.5` cores per
-  10 Gb/s NIC at line rate.
-- `nstat -a`, `ethtool -S eth0` — NIC-side drop counters.
-- `nft list table inet rawguard` — per-rule drop counters
-  (the `counter` keyword is present on each drop rule).
+- `bpftool prog tracelog` — this surfaces the kernel verifier's
+  load-time diagnostics and any `bpf_printk()` trace lines. **Neither
+  `xdp_l4_guard.c` nor `tc_l4_guard.c` contains a single
+  `bpf_printk()` call**, so at runtime this command has nothing to
+  print for this pipeline; it is only useful while debugging a
+  load/verifier failure.
+- `bpftool map dump pinned /sys/fs/bpf/<map>` — only works for a
+  pinned map. **None of the four maps
+  (`blocked_prefixes_v4`, `ipv4_rates`, `ipv6_rates`, `flow_table`)
+  declare `LIBBPF_PIN_BY_NAME`**, and the load commands shown above
+  (`ip link set ... xdp obj ...`, `tc filter add ... obj ...`) do not
+  pin them either — there is no loader in this repository. As
+  deployed via those commands, the maps are anonymous: this command
+  will not find them, `blocked_prefixes_v4` cannot be populated from
+  user space, and the rate/flow maps cannot be read.
+- `perf top` — general CPU profiling, not specific to this pipeline;
+  no baseline numbers have been measured against this code (see
+  [Status](#status)).
+- `nstat -a`, `ethtool -S eth0` — NIC/stack-level counters; they
+  reflect all traffic on the interface, not this pipeline's
+  decisions specifically.
+- `nft list table inet rawguard` — per-rule drop counters. This one
+  is real as written: every drop rule in `config/nftables.conf`
+  carries a `counter` keyword, so once the ruleset is applied these
+  numbers do reflect nftables' own decisions.
 - HAProxy stick-table:
-  `echo "show table fe_http" | socat stdio /var/run/haproxy.sock`.
+  `echo "show table fe_http" | socat stdio /var/run/haproxy.sock` —
+  the shipped `config/haproxy.cfg` does not configure a `stats
+  socket`, so this command will fail against it unless a
+  `stats socket /var/run/haproxy.sock ...` line is added to `global`
+  first.
 
-For longitudinal observation:
+There is no stats/counter map (e.g. `BPF_MAP_TYPE_PERCPU_ARRAY`) in
+either eBPF program, so no per-reason XDP/TC drop counts exist
+anywhere in this code; the `nft` per-rule counters above are the only
+real-time counters this pipeline currently produces.
 
-- Pin BPF maps to `/sys/fs/bpf/...` and have a small Go or Rust
-  daemon read them at 1 Hz.
-- Export to Prometheus; plot `(drop rate, latency, CPU)` jointly —
-  the canonical signature of an active defense engagement is *drop
-  rate up, latency stable, CPU stable*. Latency or CPU rising under
-  attack indicates a layer-misallocation; see `docs/architecture-deep-dive.md`
-  for tuning guidance.
+For longitudinal observation — not implemented here, only described
+as a design direction:
+
+- Pinning the BPF maps and having a small Go or Rust daemon read
+  them at 1 Hz is a reasonable follow-on design (see "Tuning the
+  user-space brain" below), but it does not exist in this repository
+  today.
+- Exporting to Prometheus and plotting `(drop rate, latency, CPU)`
+  jointly is likewise a documented idea, not shipped code or a
+  measured result.
 
 ---
 
@@ -300,13 +328,19 @@ by what would have to change first for production deployment:
    description but the current `tc_l4_guard.c` is IPv4-only.
    IPv6 5-tuple support is a documented next step.
 
-3. **Race-safety of in-place LRU updates.** The TC program updates
-   counters with `++` on map values rather than via
-   `bpf_map_update_elem`. The Linux verifier allows this for
-   `LRU_HASH`, but multi-core updates are non-atomic. The
-   counters are statistical, so the loss is acceptable, but a
-   strict counter would need `__sync_fetch_and_add` or
-   `BPF_F_LOCK`.
+3. **Race-safety of in-place LRU updates.** The TC program (and the
+   XDP per-IP rate windows) update counters in place on a shared
+   LRU map value rather than via a fresh `bpf_map_update_elem` per
+   packet, and multiple RSS CPUs can update the same flow/IP
+   concurrently. Per-field increments use `__sync_fetch_and_add`
+   (not a bare `++`) so a single counter cannot silently lose an
+   update. The four-field struct as a whole is still not updated as
+   one atomic transaction — a reader can observe one field bumped
+   slightly ahead of the others — which is acceptable for these
+   statistical thresholds; a fully race-free design would need
+   `BPF_F_LOCK` or `BPF_MAP_TYPE_PERCPU_HASH`. None of this has been
+   exercised against a real kernel verifier — see
+   [Status](#status).
 
 4. **`compute_mark()` thresholds are static and uncalibrated.**
    Real deployment requires per-tenant calibration; the shipped
@@ -369,10 +403,26 @@ MIT — see `LICENSE`.
 
 ## Status
 
-Research / non-production. The pipeline has been exercised on
-isolated lab traffic. Deployment on a production edge requires the
-hardening described in [Limitations](#limitations) and a calibrated
-user-space brain.
+Research / non-production, and **untested at runtime**. As of this
+writing, no BPF program in this repository has ever executed a
+single instruction on a kernel — nothing here has been built,
+loaded, or run against real or synthetic traffic. Concretely:
+
+- the two eBPF programs are source code that has been written and
+  reviewed, not compiled in this project (no clang/libbpf/Linux
+  kernel toolchain has been used against it);
+- the nftables ruleset and HAProxy config have not been dry-run or
+  applied;
+- the `tests/` suite (see `BUILD_AND_VERIFY.md` §2.4) is static:
+  file-existence checks plus regex comparisons between source files.
+  It does not compile, load, or execute any BPF code, and it does
+  not send or receive a packet. "11 passed" describes these static
+  checks, not a functional or behavioral result.
+
+Deployment on a production edge — or even a first real dynamic
+test — requires the hardening described in
+[Limitations](#limitations), an actual build/load/traffic-generation
+pass on a Linux kernel, and a calibrated user-space brain.
 
 The architectural posture — silent drop, mark-only communication,
 defense-moves-earlier-as-confidence-grows — is the contribution.

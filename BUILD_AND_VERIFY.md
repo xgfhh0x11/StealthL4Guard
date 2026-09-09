@@ -1,9 +1,10 @@
 # StealthL4Guard — Build & Verification
 
-> *Quality gate for the HBO NL portfolio. This file answers:
-> "Is this project buildable, runnable, and behaving as documented?"*
-
-> *Last updated: 2026-05-14 — post P0–P3 fix pass. CO-RE infrastructure ready; per-file port still pending.*
+> *This file answers: "Is this project buildable, runnable, and
+> behaving as documented?" — and says explicitly which parts of that
+> have actually been checked versus only read/inspected. As of this
+> writing, none of the eBPF/kernel-facing paths below have been
+> built, loaded, or run; see §2.4 and the README Status section.*
 
 ## 1. Build
 
@@ -46,8 +47,9 @@
   compiles the eBPF objects, runs `make check` (smoke-checks the `.o`
   files are non-empty ELF), then dry-runs `nft -c -f config/nftables.conf`
   and `haproxy -c -f config/haproxy.cfg`. This is the closest thing to
-  a reproducible end-to-end build verification the repo currently has,
-  and it is the path most HBO graders will exercise.
+  a reproducible end-to-end build verification the repo currently has.
+  It has not been confirmed to run green (no CI badge, single commit
+  history — see §1.2 "CI build" caveat and README Status).
 - **Per-target compile** — `make xdp_l4_guard.o` or
   `make tc_l4_guard.o` to build a single program when iterating.
 - **Clean** — `make clean` removes `*.o` and `*.ll`.
@@ -203,19 +205,33 @@ If any step fails, the verifier output is usually in
   3. `cd bpf && make check`.
   4. `sudo nft -c -f config/nftables.conf`.
   5. `sudo haproxy -c -f config/haproxy.cfg`.
-- ~~**No unit tests.** This is a data-plane project; the eBPF programs
-  are exercised functionally by the kernel verifier at load time, which
-  the manual-verification path above triggers. There is no `make test`
-  target and no userland test harness.~~ **PARTIALLY RESOLVED
-  2026-06-10** — a static `pytest` suite (`tests/`) now runs in CI and
-  locally with no kernel/libbpf: `test_structure.py` checks the
-  documented repository layout, and `test_mark_protocol.py` pins the
-  one-byte `skb->mark` contract (MARK_GREY/MARK_KILL in `tc_l4_guard.c`
-  must match the `meta mark … drop` rules in `nftables.conf`, KILL
-  unconditional vs GREY probabilistic) — a cross-layer drift the kernel
-  verifier cannot catch. CI also adds a `clang -fsyntax-only -target bpf`
-  check. Full functional load-time testing still needs a privileged
-  kernel (the manual path above / a future scapy harness).
+- **No unit tests exercise the kernel.** This is a data-plane project;
+  the eBPF programs would normally be exercised functionally by the
+  kernel verifier at load time, but that load has never happened in
+  this repository — no privileged Linux host has run the
+  manual-verification path above, and no BPF instruction from either
+  program has ever executed. There is no `make test` target and no
+  userland test harness.
+
+  What *does* exist is a static `pytest` suite (`tests/`) that
+  requires nothing beyond a Python interpreter — no kernel, no
+  libbpf, no clang: `test_structure.py` asserts that the documented
+  repository files exist, and `test_mark_protocol.py` regex-parses
+  the `#define MARK_*` constants out of `tc_l4_guard.c` and the
+  `meta mark …` rules out of `nftables.conf` and asserts they agree
+  (KILL unconditional, GREY carries a `random` qualifier). This is a
+  real, narrow check — it would catch someone renumbering `MARK_KILL`
+  without updating the nftables side — but it is a text/regex
+  comparison of source files, nothing more. It does **not** compile,
+  load, or execute any BPF code, and it sends and receives zero
+  packets. "11 passed" means these 11 static/structural assertions
+  passed; it does not imply the pipeline was run, or that any
+  packet was ever processed by it. CI additionally runs
+  `clang -fsyntax-only -target bpf`, which is a syntax check (no
+  object code emitted), not a full compile — see §3.1. Full
+  functional, load-time, and traffic testing on a privileged kernel
+  has not been done and remains the next step (a scapy/netns
+  harness, per §3.3).
 
 ## 3. Alternatives & improvements
 
@@ -239,12 +255,16 @@ If any step fails, the verifier output is usually in
   `CORE_MIGRATION.md` tracks `xdp_l4_guard.c` and `tc_l4_guard.c`
   as not-yet-ported. README §Limitations point 5 still applies in
   practice; the runway to fix it is now short.
-- **Verifier sensitivity**. The TC program performs `++` on map values
-  for an `LRU_HASH` (`tc_l4_guard.c:162-175`). The Linux verifier
-  currently accepts this pattern, but verifier semantics have tightened
-  across kernel releases; a kernel update can in principle reject the
-  program with no source change. The README documents this (§Limitations
-  point 3).
+- **Verifier sensitivity**. The TC program updates counters in place
+  on an `LRU_HASH` map value using `__sync_fetch_and_add`
+  (`tc_l4_guard.c:159-179`) rather than a plain `++`, so concurrent
+  RSS CPUs updating the same flow don't lose increments. This is
+  still an in-place, non-locked update — not `BPF_F_LOCK`, not a
+  single atomic transaction across the four counter fields — and
+  none of it has been exercised against a real kernel verifier in
+  this project (no BPF program here has ever been loaded; see
+  Status in README). The README documents the residual limitation
+  (§Limitations point 3).
 - **`compute_mark()` has no time window**. Counters accumulate
   monotonically over a flow's lifetime in the LRU hash. A long-lived
   legitimate connection will eventually cross the `MARK_KILL` threshold
@@ -322,8 +342,13 @@ If any step fails, the verifier output is usually in
     "5.10+".
 - **Medium-term (<= 1 week)**:
   - Add the IPv6 5-tuple path in `tc_l4_guard.c` (closes §Limitations 2).
-  - Add atomic counter updates via `__sync_fetch_and_add` or
-    `BPF_F_LOCK` for production hardening (closes §Limitations 3).
+  - ~~Add atomic counter updates via `__sync_fetch_and_add`~~ — done for
+    the per-field increments in both `xdp_l4_guard.c` and
+    `tc_l4_guard.c`; the remaining gap is that the four-field struct
+    update is still not a single atomic transaction (`BPF_F_LOCK` or
+    `BPF_MAP_TYPE_PERCPU_HASH` would close that). None of this has
+    been verified against a real kernel — see §2.4 and Status in
+    README.
   - Write a minimal user-space brain (Go or Rust) that pins maps under
     `/sys/fs/bpf/`, reads them at 1 Hz, and exports Prometheus metrics.
   - Add an integration test harness (network namespaces + `scapy`) that
